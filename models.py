@@ -1,5 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from datetime import datetime, UTC
 
 db = SQLAlchemy()
 
@@ -13,8 +13,8 @@ class Playlist(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     description = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
     songs = db.relationship('Song', secondary=playlist_songs, lazy='dynamic',
                           backref=db.backref('playlists', lazy=True))
 
@@ -26,7 +26,8 @@ class Song(db.Model):
     source = db.Column(db.String(20))  # 'local', 'youtube', 'bilibili'
     source_id = db.Column(db.String(100))  # 对于在线视频，存储视频ID
     thumbnail_url = db.Column(db.String(500))  # 缩略图URL
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    url = db.Column(db.String(500))  # 视频URL
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
     local_path = db.Column(db.String(500))  # 本地文件路径（如果已下载）
     
     def to_dict(self):
@@ -38,25 +39,26 @@ class Song(db.Model):
             'source': self.source,
             'source_id': self.source_id,
             'thumbnail_url': self.thumbnail_url,
+            'url': self.url,
             'local_path': self.local_path
         }
 
 class SearchHistory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     query = db.Column(db.String(200), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
 
 class PlayHistory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     song_id = db.Column(db.Integer, db.ForeignKey('song.id'), nullable=False)
-    played_at = db.Column(db.DateTime, default=datetime.utcnow)
+    played_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
     song = db.relationship('Song', backref=db.backref('play_history', lazy=True))
 
 class DownloadQueue(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     song_id = db.Column(db.Integer, db.ForeignKey('song.id'), nullable=False)
     status = db.Column(db.String(20), default='pending')  # pending, downloading, completed, failed
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
     completed_at = db.Column(db.DateTime)
     error_message = db.Column(db.String(500))
     song = db.relationship('Song', backref=db.backref('download_queue', lazy=True)) 

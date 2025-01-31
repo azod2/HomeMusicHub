@@ -8,6 +8,7 @@ import io
 from models import db, Song, Playlist, SearchHistory, PlayHistory, DownloadQueue
 from services.video_search import VideoSearchService
 import asyncio
+import json
 
 load_dotenv()
 
@@ -172,6 +173,242 @@ def get_search_history():
         print(f"Error in get_search_history: {str(e)}")
         print(traceback.format_exc())
         return jsonify({"error": f"Failed to get search history: {str(e)}"}), 500
+
+@app.route('/playlists', methods=['GET'])
+def list_playlists():
+    """獲取所有播放列表"""
+    try:
+        playlists = db.session.query(Playlist).all()
+        return jsonify([{
+            'id': p.id,
+            'name': p.name,
+            'description': p.description,
+            'created_at': p.created_at.isoformat(),
+            'updated_at': p.updated_at.isoformat(),
+            'song_count': len(p.songs.all())
+        } for p in playlists])
+    except Exception as e:
+        return jsonify({"error": f"Failed to get playlists: {str(e)}"}), 500
+
+@app.route('/playlists', methods=['POST'])
+def create_playlist():
+    """創建新的播放列表"""
+    data = request.get_json()
+    if not data or 'name' not in data:
+        return jsonify({"error": "Name is required"}), 400
+
+    try:
+        playlist = Playlist(
+            name=data['name'],
+            description=data.get('description', '')
+        )
+        db.session.add(playlist)
+        db.session.commit()
+        
+        return jsonify({
+            'id': playlist.id,
+            'name': playlist.name,
+            'description': playlist.description,
+            'created_at': playlist.created_at.isoformat(),
+            'updated_at': playlist.updated_at.isoformat(),
+            'song_count': 0
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to create playlist: {str(e)}"}), 500
+
+@app.route('/playlists/<int:playlist_id>', methods=['GET'])
+def get_playlist(playlist_id):
+    """獲取指定播放列表的詳細信息"""
+    try:
+        playlist = db.session.get(Playlist, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+
+        return jsonify({
+            'id': playlist.id,
+            'name': playlist.name,
+            'description': playlist.description,
+            'created_at': playlist.created_at.isoformat(),
+            'updated_at': playlist.updated_at.isoformat(),
+            'songs': [song.to_dict() for song in playlist.songs]
+        })
+    except Exception as e:
+        return jsonify({"error": f"Failed to get playlist: {str(e)}"}), 500
+
+@app.route('/playlists/<int:playlist_id>', methods=['DELETE'])
+def delete_playlist(playlist_id):
+    """刪除指定的播放列表"""
+    try:
+        playlist = db.session.get(Playlist, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+
+        db.session.delete(playlist)
+        db.session.commit()
+        return jsonify({"message": "Playlist deleted successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to delete playlist: {str(e)}"}), 500
+
+@app.route('/playlists/<int:playlist_id>/songs', methods=['POST'])
+def add_song_to_playlist(playlist_id):
+    """添加歌曲到播放列表"""
+    data = request.get_json()
+    if not data or not any(key in data for key in ['song_id', 'url']):
+        return jsonify({"error": "Either song_id or url is required"}), 400
+
+    try:
+        playlist = db.session.get(Playlist, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+
+        if 'song_id' in data:
+            # 添加現有歌曲
+            song = db.session.get(Song, data['song_id'])
+            if not song:
+                return jsonify({"error": "Song not found"}), 404
+        else:
+            # 從 URL 創建新歌曲
+            url = data['url']
+            existing_song = db.session.query(Song).filter_by(url=url).first()
+            if existing_song:
+                song = existing_song
+            else:
+                # 獲取視頻信息
+                if 'youtube.com' in url or 'youtu.be' in url:
+                    command = ['yt-dlp', '--dump-json', url]
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout, stderr = process.communicate()
+                    if stderr:
+                        print(f"Error getting video info: {stderr.decode()}")
+                        return jsonify({"error": "Failed to get video info"}), 500
+                    
+                    try:
+                        info = json.loads(stdout.decode())
+                        print(f"Video info: {info}")
+                        song = Song(
+                            title=info['title'],
+                            source='youtube',
+                            source_id=info['id'],
+                            thumbnail_url=info.get('thumbnail'),
+                            duration=info.get('duration'),
+                            url=url
+                        )
+                    except Exception as e:
+                        print(f"Error parsing video info: {str(e)}")
+                        return jsonify({"error": f"Error parsing video info: {str(e)}"}), 500
+                elif 'bilibili.com' in url:
+                    # TODO: 實現 Bilibili 視頻信息獲取
+                    return jsonify({"error": "Bilibili support coming soon"}), 501
+                else:
+                    return jsonify({"error": "Unsupported URL"}), 400
+
+                db.session.add(song)
+                
+        playlist.songs.append(song)
+        db.session.commit()
+        
+        return jsonify(song.to_dict())
+    except Exception as e:
+        import traceback
+        print(f"Error in add_song_to_playlist: {str(e)}")
+        print(traceback.format_exc())
+        db.session.rollback()
+        return jsonify({"error": f"Failed to add song to playlist: {str(e)}"}), 500
+
+@app.route('/playlists/<int:playlist_id>/songs/<int:song_id>', methods=['DELETE'])
+def remove_song_from_playlist(playlist_id, song_id):
+    """從播放列表中移除歌曲"""
+    try:
+        playlist = db.session.get(Playlist, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+
+        song = db.session.get(Song, song_id)
+        if not song:
+            return jsonify({"error": "Song not found"}), 404
+
+        if song not in playlist.songs:
+            return jsonify({"error": "Song is not in the playlist"}), 404
+
+        playlist.songs.remove(song)
+        db.session.commit()
+        
+        return jsonify({"message": "Song removed from playlist successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to remove song from playlist: {str(e)}"}), 500
+
+@app.route('/playlists/import', methods=['POST'])
+def import_playlist():
+    """導入 YouTube 或 Bilibili 播放列表"""
+    data = request.get_json()
+    if not data or 'url' not in data or 'name' not in data:
+        return jsonify({"error": "URL and name are required"}), 400
+
+    try:
+        url = data['url']
+        if 'youtube.com/playlist' in url:
+            # 獲取 YouTube 播放列表信息
+            command = ['yt-dlp', '--dump-json', '--flat-playlist', url]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            if stderr:
+                print(f"Error getting playlist info: {stderr.decode()}")
+                return jsonify({"error": "Failed to get playlist info"}), 500
+
+            try:
+                # 創建播放列表
+                playlist = Playlist(
+                    name=data['name'],
+                    description=data.get('description', '')
+                )
+                db.session.add(playlist)
+
+                # 添加歌曲
+                for line in stdout.decode().split('\n'):
+                    if not line:
+                        continue
+                    try:
+                        info = json.loads(line)
+                        print(f"Song info: {info}")
+                        song = Song(
+                            title=info['title'],
+                            source='youtube',
+                            source_id=info['id'],
+                            thumbnail_url=info.get('thumbnail'),
+                            duration=info.get('duration'),
+                            url=f"https://www.youtube.com/watch?v={info['id']}"
+                        )
+                        db.session.add(song)
+                        playlist.songs.append(song)
+                    except Exception as e:
+                        print(f"Error processing song: {str(e)}")
+                        continue
+
+                db.session.commit()
+                return jsonify({
+                    'id': playlist.id,
+                    'name': playlist.name,
+                    'description': playlist.description,
+                    'song_count': len(playlist.songs.all())
+                })
+            except Exception as e:
+                print(f"Error processing playlist: {str(e)}")
+                db.session.rollback()
+                return jsonify({"error": f"Error processing playlist: {str(e)}"}), 500
+        elif 'bilibili.com' in url:
+            # TODO: 實現 Bilibili 播放列表導入
+            return jsonify({"error": "Bilibili playlist import coming soon"}), 501
+        else:
+            return jsonify({"error": "Unsupported URL"}), 400
+    except Exception as e:
+        import traceback
+        print(f"Error in import_playlist: {str(e)}")
+        print(traceback.format_exc())
+        db.session.rollback()
+        return jsonify({"error": f"Failed to import playlist: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=os.getenv("PORT", 5000), debug=True)
