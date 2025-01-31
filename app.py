@@ -5,26 +5,56 @@ import subprocess
 import glob
 from dotenv import load_dotenv
 import io
+from models import db, Song, Playlist, SearchHistory, PlayHistory, DownloadQueue
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-MUSIC_DIR = os.path.abspath(os.getenv("MUSIC_DIR", "./music"))
+# 数据库配置
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///music_hub.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
+
+# 设置默认音乐目录
+app.config.setdefault('MUSIC_DIR', os.path.abspath(os.getenv("MUSIC_DIR", "./music")))
 ALLOWED_EXTENSIONS = ('.mp3', '.flac', '.wav', '.aac', '.m4a', '.mp4', '.mkv', '.avi', '.mov')
 current_process = None
 
+# 创建数据库表
+with app.app_context():
+    db.create_all()
+
 def get_music_files():
     music_files = []
+    music_dir = app.config['MUSIC_DIR']
     for ext in ALLOWED_EXTENSIONS:
-        music_files.extend(glob.glob(os.path.join(MUSIC_DIR, f'*{ext}')))
+        music_files.extend(glob.glob(os.path.join(music_dir, f'*{ext}')))
     return music_files
 
 @app.route('/music')
 def list_music():
     music_files = get_music_files()
-    return jsonify([os.path.basename(f) for f in music_files])
+    print(f"Found music files: {music_files}")  # 添加调试信息
+    
+    # 将本地音乐文件同步到数据库
+    with app.app_context():
+        for file_path in music_files:
+            filename = os.path.basename(file_path)
+            existing_song = Song.query.filter_by(local_path=file_path).first()
+            if not existing_song:
+                new_song = Song(
+                    title=filename,
+                    source='local',
+                    local_path=file_path
+                )
+                db.session.add(new_song)
+        db.session.commit()
+        
+        # 返回所有本地音乐
+        local_songs = Song.query.filter_by(source='local').all()
+        return jsonify([song.to_dict() for song in local_songs])
 
 @app.route('/play', methods=['POST'])
 def play_music():
@@ -36,7 +66,7 @@ def play_music():
     if not any(filename.endswith(ext) for ext in ALLOWED_EXTENSIONS):
         return jsonify({"error": "Invalid file format"}), 400
 
-    full_path = os.path.join(MUSIC_DIR, filename)
+    full_path = os.path.join(app.config['MUSIC_DIR'], filename)
     if not os.path.exists(full_path):
         return jsonify({"error": "File not found"}), 404
 
@@ -74,7 +104,7 @@ def stop_music():
 
 @app.route('/stream/<path:filename>')
 def stream_music(filename):
-    full_path = os.path.join(MUSIC_DIR, filename)
+    full_path = os.path.join(app.config['MUSIC_DIR'], filename)
     print(f"stream_music: full_path={full_path}")
     if not os.path.exists(full_path):
         print(f"stream_music: File not found at {full_path}")
