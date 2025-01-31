@@ -9,6 +9,7 @@ from models import db, Song, Playlist, SearchHistory, PlayHistory, DownloadQueue
 from services.video_search import VideoSearchService
 import asyncio
 import json
+from datetime import datetime, UTC
 
 load_dotenv()
 
@@ -409,6 +410,198 @@ def import_playlist():
         print(traceback.format_exc())
         db.session.rollback()
         return jsonify({"error": f"Failed to import playlist: {str(e)}"}), 500
+
+@app.route('/downloads', methods=['GET'])
+def list_downloads():
+    """獲取下載隊列"""
+    try:
+        downloads = db.session.query(DownloadQueue).order_by(DownloadQueue.created_at.desc()).all()
+        return jsonify([{
+            'id': d.id,
+            'song': d.song.to_dict(),
+            'status': d.status,
+            'created_at': d.created_at.isoformat(),
+            'completed_at': d.completed_at.isoformat() if d.completed_at else None,
+            'error_message': d.error_message
+        } for d in downloads])
+    except Exception as e:
+        return jsonify({"error": f"Failed to get download queue: {str(e)}"}), 500
+
+@app.route('/downloads', methods=['POST'])
+def add_download():
+    """添加下載任務"""
+    data = request.get_json()
+    if not data or not any(key in data for key in ['song_id', 'url']):
+        return jsonify({"error": "Either song_id or url is required"}), 400
+
+    try:
+        if 'song_id' in data:
+            song = db.session.get(Song, data['song_id'])
+            if not song:
+                return jsonify({"error": "Song not found"}), 404
+        else:
+            # 從 URL 創建新歌曲
+            url = data['url']
+            existing_song = db.session.query(Song).filter_by(url=url).first()
+            if existing_song:
+                song = existing_song
+            else:
+                if 'youtube.com' in url or 'youtu.be' in url:
+                    command = ['yt-dlp', '--dump-json', url]
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout, stderr = process.communicate()
+                    if stderr:
+                        return jsonify({"error": "Failed to get video info"}), 500
+
+                    info = json.loads(stdout.decode())
+                    song = Song(
+                        title=info['title'],
+                        source='youtube',
+                        source_id=info['id'],
+                        thumbnail_url=info.get('thumbnail'),
+                        duration=info.get('duration'),
+                        url=url
+                    )
+                    db.session.add(song)
+                elif 'bilibili.com' in url:
+                    return jsonify({"error": "Bilibili download not supported yet"}), 501
+                else:
+                    return jsonify({"error": "Unsupported URL"}), 400
+
+        # 檢查是否已經在下載隊列中
+        existing_download = db.session.query(DownloadQueue).filter_by(song_id=song.id).first()
+        if existing_download and existing_download.status in ['pending', 'downloading']:
+            return jsonify({"error": "Song is already in download queue"}), 400
+
+        # 創建下載任務
+        download = DownloadQueue(
+            song=song,
+            status='pending'
+        )
+        db.session.add(download)
+        db.session.commit()
+
+        # 啟動下載處理（異步）
+        asyncio.run_coroutine_threadsafe(process_download(download.id), asyncio.get_event_loop())
+
+        return jsonify({
+            'id': download.id,
+            'song': song.to_dict(),
+            'status': download.status,
+            'created_at': download.created_at.isoformat()
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to add download: {str(e)}"}), 500
+
+@app.route('/downloads/<int:download_id>', methods=['DELETE'])
+def cancel_download(download_id):
+    """取消下載任務"""
+    try:
+        download = db.session.get(DownloadQueue, download_id)
+        if not download:
+            return jsonify({"error": "Download not found"}), 404
+
+        if download.status not in ['pending', 'downloading']:
+            return jsonify({"error": "Cannot cancel completed or failed download"}), 400
+
+        download.status = 'cancelled'
+        db.session.commit()
+
+        return jsonify({"message": "Download cancelled successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to cancel download: {str(e)}"}), 500
+
+async def process_download(download_id):
+    """處理下載任務"""
+    try:
+        with app.app_context():
+            download = db.session.get(DownloadQueue, download_id)
+            if not download or download.status != 'pending':
+                return
+
+            download.status = 'downloading'
+            db.session.commit()
+
+            song = download.song
+            if not song.url:
+                raise ValueError("Song URL is missing")
+
+            # 創建下載目錄（如果不存在）
+            os.makedirs(app.config['MUSIC_DIR'], exist_ok=True)
+
+            # 設置下載選項
+            output_template = os.path.join(app.config['MUSIC_DIR'], '%(title)s.%(ext)s')
+            if 'youtube.com' in song.url or 'youtu.be' in song.url:
+                command = [
+                    'yt-dlp',
+                    '-f', 'bestaudio',
+                    '-x',  # 提取音頻
+                    '--audio-format', 'mp3',  # 轉換為 mp3
+                    '--audio-quality', '0',  # 最高音質
+                    '-o', output_template,
+                    song.url
+                ]
+            else:
+                raise ValueError("Unsupported URL type")
+
+            # 執行下載
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                raise Exception(f"Download failed: {stderr.decode()}")
+
+            # 更新歌曲本地路徑
+            downloaded_files = glob.glob(os.path.join(app.config['MUSIC_DIR'], f"{song.title}.*"))
+            if downloaded_files:
+                song.local_path = downloaded_files[0]
+                download.status = 'completed'
+                download.completed_at = datetime.now(UTC)
+            else:
+                raise Exception("Downloaded file not found")
+
+            db.session.commit()
+
+    except Exception as e:
+        with app.app_context():
+            download = db.session.get(DownloadQueue, download_id)
+            if download:
+                download.status = 'failed'
+                download.error_message = str(e)
+                db.session.commit()
+
+# 初始化下載處理器
+async def init_download_processor():
+    """初始化下載處理器，處理未完成的下載任務"""
+    try:
+        with app.app_context():
+            pending_downloads = db.session.query(DownloadQueue).filter(
+                DownloadQueue.status.in_(['pending', 'downloading'])
+            ).all()
+            
+            for download in pending_downloads:
+                asyncio.create_task(process_download(download.id))
+    except Exception as e:
+        print(f"Error initializing download processor: {str(e)}")
+
+# 在應用啟動時初始化下載處理器
+def init_app():
+    with app.app_context():
+        db.create_all()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.create_task(init_download_processor())
+
+init_app()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=os.getenv("PORT", 5000), debug=True)
