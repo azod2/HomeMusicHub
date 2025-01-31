@@ -26,7 +26,7 @@ v-model="youtubeUrl"
 <script>
 import axios from 'axios';
 import { nextTick } from 'vue';
-const API_URL = 'http://192.168.50.40:5000';
+const API_URL = 'http://192.168.50.42:5000';
 
 export default {
   data() {

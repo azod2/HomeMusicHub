@@ -6,6 +6,8 @@ import glob
 from dotenv import load_dotenv
 import io
 from models import db, Song, Playlist, SearchHistory, PlayHistory, DownloadQueue
+from services.video_search import VideoSearchService
+import asyncio
 
 load_dotenv()
 
@@ -25,6 +27,9 @@ current_process = None
 # 创建数据库表
 with app.app_context():
     db.create_all()
+
+# 初始化服务
+video_search_service = VideoSearchService()
 
 def get_music_files():
     music_files = []
@@ -136,6 +141,37 @@ def stream_music(filename):
     except Exception as e:
         print(f"stream_music: Error reading file: {str(e)}")
         return jsonify({"error": f"Error reading file: {str(e)}"}), 500
+
+@app.route('/search')
+def search_videos():
+    query = request.args.get('q')
+    if not query:
+        return jsonify({"error": "Query parameter 'q' is required"}), 400
+
+    try:
+        # 使用 asyncio 运行异步搜索
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(video_search_service.search_all(query))
+        loop.close()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": f"Search failed: {str(e)}"}), 500
+
+@app.route('/search/history')
+def get_search_history():
+    try:
+        history = db.session.query(SearchHistory).order_by(SearchHistory.created_at.desc()).limit(10).all()
+        result = [{
+            'query': h.query,
+            'created_at': h.created_at.isoformat()
+        } for h in history]
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        print(f"Error in get_search_history: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({"error": f"Failed to get search history: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=os.getenv("PORT", 5000), debug=True)
